@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""island — show the progress of any long-running job around your Mac's notch.
+
+  island run   --title "Build" -- make -j8            wrap a command; ✓ or ✗ when it exits
+  island pipe  --title "Export" --regex '(\\d+)%'      read stdin, pass it through, take the last number as percent
+  island watch ID --title T --dir out --glob '*.png' --total 168     count files
+  island watch ID --title T --log train.log --regex 'step (\\d+)' --total 5000
+  island watch ID --title T --log dl.log --regex '(\\d+)%' --percent
+  island watch ID --title T --size big.zip --total 734003200          watch a file grow
+  island watch ID --title T --pid 12345                                unknown progress, just "still running"
+  island set   ID 0.42 | 99/168 [--title T]            report progress yourself
+  island done  ID [--fail]
+  island list | clear | demo | setup claude|codex | uninstall
+
+watch leaves a tiny background watcher (one check per second) that finishes the job at 100 %
+or when --pid exits. --after ID queues a job behind another one.
+State lives in $ISLAND_HOME/jobs/*.json (default ~/.island) — any program can write those files directly."""
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
+
+HOME = os.path.expanduser(os.environ.get("ISLAND_HOME") or "~/.island")
+JOBS = os.path.join(HOME, "jobs")
+APP = os.path.join(HOME, "Island.app")
+SELF = os.path.realpath(__file__)
+
+
+def path(i):
+    return os.path.join(JOBS, re.sub(r"[^\w.\-]", "_", i) + ".json")
+
+
+def read(i):
+    try:
+        return json.load(open(path(i)))
+    except Exception:
+        return None
+
+
+def write(i, **kw):
+    j = read(i) or dict(id=i, title=i, sub="", progress=-1.0, current=None, total=None, status="running", started=time.time(), eta=None)
+    j.update({k: v for k, v in kw.items() if v is not None or k in ("eta", "current", "total")})
+    j["updated"] = time.time()
+    tmp = path(i) + ".tmp"
+    json.dump(j, open(tmp, "w"), ensure_ascii=False)
+    os.replace(tmp, path(i))
+    return j
+
+
+def ensure_app():
+    os.makedirs(JOBS, exist_ok=True)
+    if os.environ.get("ISLAND_NO_APP"):
+        return
+    if subprocess.run(["pgrep", "-f", os.path.join(APP, "Contents/MacOS/Island")], capture_output=True).returncode != 0:
+        if os.path.isdir(APP):
+            subprocess.run(["open", "-g", APP])  # -g: never steal focus
+        else:
+            print(f"island: {APP} not found — run install.sh", file=sys.stderr)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def measure(a):
+    if a.dir:
+        return float(len(glob.glob(os.path.join(os.path.expanduser(a.dir), a.glob))))
+    if a.size:
+        try:
+            return float(os.path.getsize(os.path.expanduser(a.size)))
+        except OSError:
+            return 0.0
+    if a.log:
+        try:
+            with open(os.path.expanduser(a.log), "rb") as f:
+                f.seek(0, 2); n = f.tell(); f.seek(max(0, n - 20000))
+                m = re.findall(a.regex, f.read().decode("utf-8", "ignore"))
+            if m:
+                return float(m[-1] if isinstance(m[-1], str) else m[-1][0])
+        except (OSError, ValueError):
+            pass
+        return 0.0
+    return None
+
+
+class Eta:
+    def __init__(self):
+        self.h = []
+
+    def __call__(self, cur, total):
+        now = time.time()
+        self.h.append((now, cur)); self.h = [x for x in self.h if now - x[0] <= 90]
+        if total and len(self.h) > 3 and self.h[-1][1] > self.h[0][1]:
+            return (total - cur) * (self.h[-1][0] - self.h[0][0]) / (self.h[-1][1] - self.h[0][1])
+        return None
+
+
+def watcher(a):
+    eta = Eta()
+    total = 100.0 if a.percent else a.total
+    counted = not (a.percent or a.size)
+    while True:
+        j = read(a.id)
+        if j is None or j["status"] not in ("running", "queued"):
+            return  # finished or cleared by someone else
+        if a.after:
+            prev = read(a.after)
+            if prev is not None and prev["status"] in ("running", "queued"):
+                write(a.id, status="queued", progress=0.0 if total else -1.0)
+                time.sleep(1); continue
+        cur = measure(a)
+        gone = a.pid and not alive(a.pid)
+        if cur is None:
+            if gone:
+                write(a.id, status="done", progress=1.0, eta=None); return
+            write(a.id, status="running")
+        else:
+            p = min(1.0, cur / total) if total else -1.0
+            show = cur if counted else None
+            tot = total if counted else None
+            if total and cur >= total:
+                write(a.id, status="done", progress=1.0, current=show, total=tot, eta=None); return
+            if gone:
+                write(a.id, status="failed" if total else "done", progress=p, current=show, total=tot, eta=None); return
+            write(a.id, status="running", progress=p, current=show, total=tot, eta=eta(cur, total))
+        time.sleep(1)
+
+
+def daemonize():
+    if os.fork():
+        return False
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    nul = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(nul, fd)
+    return True
+
+
+# ---------- integrations ----------
+HOOK = os.path.join(HOME, "hooks", "agent_bash_hook.py")
+SNIPPET = """## Long-running work: show progress in the notch (Agent Island)
+- A hook already shows any shell command that runs longer than 20 s as "still running" and clears it when it exits.
+- When progress is measurable (renders, exports, batch jobs, downloads, training), register real progress yourself, without being asked:
+  `island watch <id> --title "<short title>"` plus one of `--dir D --glob G --total N` (count files), `--log F --regex R --total N` (parse a log), `--size F --total BYTES` (file size). Chain stages with `--after <previous id>`.
+- Or wrap a command: `island run --title "<short title>" -- <command>`; or pipe output: `<command> | island pipe --title T --regex '(\\d+)%'`.
+- Titles: at most ~12 characters, no paths. If you abort a job or it fails: `island done <id> --fail`. `island --help` for everything.
+"""
+
+
+def merge_hook(settings_path, style):
+    """Add a PreToolUse/Bash hook to a Claude Code settings.json or a Codex hooks.json (same shape), keeping everything else."""
+    entry = {"matcher": "Bash", "hooks": [{"type": "command", "command": f"{HOOK} 2>/dev/null || true", "timeout": 5}]}
+    data = {}
+    if os.path.exists(settings_path):
+        data = json.load(open(settings_path))
+        shutil.copy(settings_path, settings_path + ".bak-island")
+    hooks = data.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    if any("agent_bash_hook.py" in h.get("command", "") or "hook_bash.py" in h.get("command", "") for g in pre for h in g.get("hooks", [])):
+        pre[:] = [g for g in pre if not any("agent_bash_hook.py" in h.get("command", "") or "hook_bash.py" in h.get("command", "") for h in g.get("hooks", []))]
+    pre.append(entry)
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    json.dump(data, open(settings_path, "w"), indent=2, ensure_ascii=False)
+    print(f"  hook  → {settings_path}")
+
+
+def add_snippet(md_path):
+    old = open(md_path).read() if os.path.exists(md_path) else ""
+    mark = "## Long-running work: show progress in the notch (Agent Island)"
+    if mark in old:
+        old = old[:old.index(mark)].rstrip("\n") + "\n"
+    os.makedirs(os.path.dirname(md_path), exist_ok=True)
+    open(md_path, "w").write((old.rstrip("\n") + "\n\n" if old.strip() else "") + SNIPPET)
+    print(f"  rules → {md_path}")
+
+
+def setup(which):
+    share = os.path.join(HOME, "share")
+    if which == "claude":
+        merge_hook(os.path.expanduser("~/.claude/settings.json"), "claude")
+        add_snippet(os.path.expanduser("~/.claude/CLAUDE.md"))
+        src = os.path.join(share, "agents", "progress-island.md")
+        if os.path.exists(src):
+            os.makedirs(os.path.expanduser("~/.claude/agents"), exist_ok=True)
+            shutil.copy(src, os.path.expanduser("~/.claude/agents/progress-island.md")); print("  agent → ~/.claude/agents/progress-island.md")
+        skills = os.path.expanduser("~/.claude/skills/island-progress")
+        print("Claude Code: open /hooks once (or restart) so running sessions pick the hook up.")
+    else:
+        merge_hook(os.path.expanduser("~/.codex/hooks.json"), "codex")
+        add_snippet(os.path.expanduser("~/.codex/AGENTS.md"))
+        skills = os.path.expanduser("~/.codex/skills/island-progress")
+        print("Codex: it will ask you to trust the new hook the next time it starts.")
+    src = os.path.join(share, "skills", "island-progress")
+    if os.path.isdir(src):
+        shutil.copytree(src, skills, dirs_exist_ok=True); print(f"  skill → {skills}")
+
+
+def demo():
+    """A scripted tour of every state, for screenshots."""
+    for f in glob.glob(os.path.join(JOBS, "demo-*.json")):
+        os.remove(f)
+    ensure_app()
+    write("demo-2", title="Upload", status="queued", progress=0.0); write("demo-3", title="Deploy", status="queued", progress=0.0)
+    t0 = time.time(); eta = Eta()
+    while (p := (time.time() - t0) / 9.0) < 1:
+        q = p * p * (3 - 2 * p)
+        write("demo-1", title="Rendering", progress=q, current=round(q * 240), total=240, eta=(1 - q) * 9); time.sleep(0.1)
+    write("demo-1", status="done", progress=1.0, current=240, total=240, eta=None); time.sleep(3.2)
+    os.remove(path("demo-1")); write("demo-2", title="Upload", status="running", progress=-1.0)
+    time.sleep(4.5); write("demo-2", status="done", progress=1.0); time.sleep(3.2)
+    os.remove(path("demo-2")); write("demo-3", title="Deploy", status="running", progress=0.0)
+    t0 = time.time()
+    while (p := (time.time() - t0) / 3.5) < 0.62:
+        write("demo-3", title="Deploy", status="running", progress=p, eta=(1 - p) * 3.5); time.sleep(0.1)
+    write("demo-3", status="failed", eta=None); time.sleep(3.5)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="island", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    w = sp.add_parser("watch"); w.add_argument("id"); w.add_argument("--title", required=True); w.add_argument("--sub", default="")
+    w.add_argument("--dir"); w.add_argument("--glob", default="*"); w.add_argument("--log"); w.add_argument("--regex"); w.add_argument("--size")
+    w.add_argument("--total", type=float); w.add_argument("--percent", action="store_true"); w.add_argument("--pid", type=int); w.add_argument("--after")
+    r = sp.add_parser("run"); r.add_argument("--title", required=True); r.add_argument("--id"); r.add_argument("rest", nargs=argparse.REMAINDER)
+    pp = sp.add_parser("pipe"); pp.add_argument("--title", required=True); pp.add_argument("--id"); pp.add_argument("--regex", default=r"(\d+(?:\.\d+)?)\s*%"); pp.add_argument("--total", type=float)
+    s = sp.add_parser("set"); s.add_argument("id"); s.add_argument("value"); s.add_argument("--title"); s.add_argument("--sub")
+    d = sp.add_parser("done"); d.add_argument("id"); d.add_argument("--fail", action="store_true"); d.add_argument("--sub")
+    st = sp.add_parser("setup"); st.add_argument("agent", choices=["claude", "codex"])
+    for name in ("list", "clear", "demo", "uninstall"):
+        sp.add_parser(name)
+    a = ap.parse_args()
+
+    if a.cmd == "watch":
+        if a.log and not a.regex:
+            ap.error("--log needs --regex")
+        ensure_app()
+        try:
+            os.remove(path(a.id))
+        except OSError:
+            pass
+        write(a.id, title=a.title, sub=a.sub, status="queued" if a.after else "running", progress=0.0 if (a.total or a.percent) else -1.0)
+        if daemonize():
+            watcher(a); os._exit(0)
+        print(f"island: watching {a.id}")
+    elif a.cmd == "run":
+        cmd = a.rest[1:] if a.rest[:1] == ["--"] else a.rest
+        if not cmd:
+            ap.error("nothing to run")
+        i = a.id or f"run-{os.getpid()}"
+        ensure_app(); write(i, title=a.title, progress=-1.0)
+        p = subprocess.Popen(cmd)
+        try:
+            while p.poll() is None:
+                write(i); time.sleep(1)
+        except KeyboardInterrupt:
+            p.terminate(); p.wait()
+        write(i, status="done" if p.returncode == 0 else "failed", progress=1.0 if p.returncode == 0 else -1.0)
+        sys.exit(p.returncode or 0)
+    elif a.cmd == "pipe":
+        i = a.id or f"pipe-{os.getpid()}"
+        ensure_app(); write(i, title=a.title, progress=-1.0)
+        rx, eta, last, total = re.compile(a.regex), Eta(), 0.0, a.total or 100.0
+        for line in sys.stdin:
+            sys.stdout.write(line); sys.stdout.flush()
+            m = rx.findall(line)
+            now = time.time()
+            if m:
+                cur = float(m[-1] if isinstance(m[-1], str) else m[-1][0])
+                write(i, progress=min(1.0, cur / total), eta=eta(cur, total)); last = now
+            elif now - last > 1:
+                write(i); last = now
+        write(i, status="done", progress=1.0, eta=None)
+    elif a.cmd == "set":
+        ensure_app()
+        if "/" in a.value:
+            c, t = map(float, a.value.split("/")); write(a.id, title=a.title, sub=a.sub, status="running", progress=c / t if t else -1.0, current=c, total=t)
+        else:
+            v = float(a.value); write(a.id, title=a.title, sub=a.sub, status="running", progress=v / 100 if v > 1 else v)
+    elif a.cmd == "done":
+        if read(a.id) is None:
+            ensure_app()
+        write(a.id, status="failed" if a.fail else "done", progress=-1.0 if a.fail else 1.0, sub=a.sub, eta=None)
+    elif a.cmd == "list":
+        for f in sorted(glob.glob(os.path.join(JOBS, "*.json"))):
+            j = json.load(open(f)); print(f"{j['id']:<22} {j['status']:<8} {max(0, j['progress']) * 100:5.1f}%  {j['title']}")
+    elif a.cmd == "clear":
+        for f in glob.glob(os.path.join(JOBS, "*.json")):
+            os.remove(f)
+    elif a.cmd == "demo":
+        demo()
+    elif a.cmd == "setup":
+        setup(a.agent)
+    elif a.cmd == "uninstall":
+        subprocess.run(["pkill", "-f", os.path.join(APP, "Contents/MacOS/Island")])
+        print(f"Remove {HOME} and the `island` symlink to finish; hooks: delete the agent_bash_hook.py entry from ~/.claude/settings.json and ~/.codex/hooks.json.")
+
+
+if __name__ == "__main__":
+    main()
